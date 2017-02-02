@@ -230,7 +230,7 @@ module Searchkick
           }
           settings[:analysis][:analyzer][default_analyzer][:filter].insert(5, "searchkick_stopword")
           settings[:analysis][:analyzer][default_analyzer][:filter] << "searchkick_stopword"
-
+        end
 
         if options[:special_characters] == false
           settings[:analysis][:analyzer].each do |_, analyzer_settings|
