@@ -167,7 +167,8 @@ module Searchkick
         if synonyms.any?
           settings[:analysis][:filter][:searchkick_synonym] = {
             type: "synonym",
-            synonyms: synonyms.select { |s| s.size > 1 }.map { |s| s.is_a?(Array) ? s.join(",") : s }
+            expaned: 0,
+            synonyms: synonyms.flatten
           }
           # choosing a place for the synonym filter when stemming is not easy
           # https://groups.google.com/forum/#!topic/elasticsearch/p7qcQlgHdB8
@@ -178,7 +179,7 @@ module Searchkick
           # - Only apply the synonym expansion at index time
           # - Don't have the synonym filter applied search
           # - Use directional synonyms where appropriate. You want to make sure that you're not injecting terms that are too general.
-          settings[:analysis][:analyzer][default_analyzer][:filter].insert(4, "searchkick_synonym")
+          settings[:analysis][:analyzer][default_analyzer][:filter].insert(0, "searchkick_synonym")
           settings[:analysis][:analyzer][default_analyzer][:filter] << "searchkick_synonym"
 
           %w(word_start word_middle word_end).each do |type|
@@ -200,6 +201,36 @@ module Searchkick
             settings[:analysis][:analyzer]["searchkick_#{type}_index".to_sym][:filter].insert(2, "searchkick_wordnet")
           end
         end
+
+        # search synonyms
+        search_synonyms = options[:search_synonyms] || []
+        search_synonyms = search_synonyms.call if search_synonyms.respond_to?(:call)
+
+        if search_synonyms.any?
+          settings[:analysis][:filter][:searchkick_search_synonym] = {
+            type: "synonym",
+            expanded: 1,
+            synonyms: search_synonyms.flatten
+          }
+
+          settings[:analysis][:analyzer][:searchkick_search][:filter].insert(0, "searchkick_search_synonym")
+          settings[:analysis][:analyzer][:searchkick_search][:filter] << "searchkick_search_synonym"
+          settings[:analysis][:analyzer][:searchkick_search2][:filter].insert(0, "searchkick_search_synonym")
+          settings[:analysis][:analyzer][:searchkick_search2][:filter] << "searchkick_search_synonym"
+        end
+
+        # stopwords
+        stopwords = options[:stopwords] || []
+
+        stopwords = stopwords.call if stopwords.respond_to?(:call)
+        if stopwords.any?
+          settings[:analysis][:filter][:searchkick_stopword] = {
+            type: "stop",
+            stopwords: stopwords.join(",")
+          }
+          settings[:analysis][:analyzer][default_analyzer][:filter].insert(5, "searchkick_stopword")
+          settings[:analysis][:analyzer][default_analyzer][:filter] << "searchkick_stopword"
+
 
         if options[:special_characters] == false
           settings[:analysis][:analyzer].each do |_, analyzer_settings|
