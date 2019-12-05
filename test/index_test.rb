@@ -1,9 +1,15 @@
 require_relative "test_helper"
 
 class IndexTest < Minitest::Test
+  def setup
+    super
+    Region.destroy_all
+  end
+
   def test_clean_indices
-    old_index = Searchkick::Index.new("products_test_20130801000000000")
-    different_index = Searchkick::Index.new("items_test_20130801000000000")
+    suffix = Searchkick.index_suffix ? "_#{Searchkick.index_suffix}" : ""
+    old_index = Searchkick::Index.new("products_test#{suffix}_20130801000000000")
+    different_index = Searchkick::Index.new("items_test#{suffix}_20130801000000000")
 
     old_index.delete if old_index.exists?
     different_index.delete if different_index.exists?
@@ -20,7 +26,8 @@ class IndexTest < Minitest::Test
   end
 
   def test_clean_indices_old_format
-    old_index = Searchkick::Index.new("products_test_20130801000000")
+    suffix = Searchkick.index_suffix ? "_#{Searchkick.index_suffix}" : ""
+    old_index = Searchkick::Index.new("products_test#{suffix}_20130801000000")
     old_index.create
 
     Product.searchkick_index.clean_indices
@@ -40,16 +47,23 @@ class IndexTest < Minitest::Test
     assert_equal 1, Product.searchkick_index.total_docs
   end
 
-  def test_mapping
+  def test_mappings
     store_names ["Dollar Tree"], Store
-    assert_equal [], Store.search(body: {query: {match: {name: "dollar"}}}).map(&:name)
-    assert_equal ["Dollar Tree"], Store.search(body: {query: {match: {name: "Dollar Tree"}}}).map(&:name)
+    assert_equal ["Dollar Tree"], Store.search(body: {query: {match: {name: "dollar"}}}).map(&:name)
+    mapping = Store.search_index.mapping.values.first["mappings"]
+    mapping = mapping["store"] if Searchkick.server_below?("7.0.0")
+    assert_equal "text", mapping["properties"]["name"]["type"]
   end
 
   def test_body
     store_names ["Dollar Tree"], Store
-    assert_equal [], Store.search(body: {query: {match: {name: "dollar"}}}).map(&:name)
-    assert_equal ["Dollar Tree"], Store.search(body: {query: {match: {name: "Dollar Tree"}}}, load: false).map(&:name)
+    assert_equal ["Dollar Tree"], Store.search(body: {query: {match: {name: "dollar"}}}, load: false).map(&:name)
+  end
+
+  def test_body_incompatible_options
+    assert_raises(ArgumentError) do
+      Store.search(body: {query: {match: {name: "dollar"}}}, where: {id: 1})
+    end
   end
 
   def test_block
@@ -72,7 +86,9 @@ class IndexTest < Minitest::Test
   def test_record_not_found
     store_names ["Product A", "Product B"]
     Product.where(name: "Product A").delete_all
-    assert_search "product", ["Product B"]
+    assert_output nil, /\[searchkick\] WARNING: Records in search index do not exist in database/ do
+      assert_search "product", ["Product B"]
+    end
   ensure
     Product.reindex
   end
@@ -80,7 +96,8 @@ class IndexTest < Minitest::Test
   def test_bad_mapping
     Product.searchkick_index.delete
     store_names ["Product A"]
-    assert_raises(Searchkick::InvalidQueryError) { Product.search "test" }
+    error = assert_raises(Searchkick::InvalidQueryError) { Product.search "test" }
+    assert_equal "Bad mapping - run Product.reindex", error.message
   ensure
     Product.reindex
   end
@@ -120,15 +137,33 @@ class IndexTest < Minitest::Test
   def test_filterable
     # skip for 5.0 since it throws
     # Cannot search on field [alt_description] since it is not indexed.
-    skip unless elasticsearch_below50?
     store [{name: "Product A", alt_description: "Hello"}]
-    assert_search "*", [], where: {alt_description: "Hello"}
+    assert_raises(Searchkick::InvalidQueryError) do
+      assert_search "*", [], where: {alt_description: "Hello"}
+    end
+  end
+
+  def test_filterable_non_string
+    store [{name: "Product A", store_id: 1}]
+    assert_search "*", ["Product A"], where: {store_id: 1}
   end
 
   def test_large_value
     skip if nobrainer?
+    large_value = 1000.times.map { "hello" }.join(" ")
+    store [{name: "Product A", text: large_value}], Region
+    assert_search "product", ["Product A"], {}, Region
+    assert_search "hello", ["Product A"], {fields: [:name, :text]}, Region
+    assert_search "hello", ["Product A"], {}, Region
+  end
+
+  def test_very_large_value
+    skip if nobrainer?
     large_value = 10000.times.map { "hello" }.join(" ")
-    store [{name: "Product A", alt_description: large_value}]
-    assert_search "product", ["Product A"]
+    store [{name: "Product A", text: large_value}], Region
+    assert_search "product", ["Product A"], {}, Region
+    assert_search "hello", ["Product A"], {fields: [:name, :text]}, Region
+    # values that exceed ignore_above are not included in _all field :(
+    # assert_search "hello", ["Product A"], {}, Region
   end
 end

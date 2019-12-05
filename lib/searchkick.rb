@@ -1,33 +1,32 @@
-require "active_model"
+require "active_support"
+require "active_support/core_ext/hash/deep_merge"
 require "elasticsearch"
 require "hashie"
-require "searchkick/version"
-require "searchkick/index_options"
+
+require "searchkick/bulk_indexer"
 require "searchkick/index"
 require "searchkick/indexer"
-require "searchkick/reindex_queue"
-require "searchkick/results"
-require "searchkick/query"
-require "searchkick/model"
-require "searchkick/tasks"
+require "searchkick/hash_wrapper"
 require "searchkick/middleware"
-require "searchkick/logging" if defined?(ActiveSupport::Notifications)
-require "active_support/core_ext/hash/deep_merge"
+require "searchkick/model"
+require "searchkick/multi_search"
+require "searchkick/query"
+require "searchkick/reindex_queue"
+require "searchkick/record_data"
+require "searchkick/record_indexer"
+require "searchkick/results"
+require "searchkick/version"
 
-# background jobs
-begin
-  require "active_job"
-rescue LoadError
-  # do nothing
-end
-if defined?(ActiveJob)
-  require "searchkick/bulk_reindex_job"
-  require "searchkick/process_queue_job"
-  require "searchkick/process_batch_job"
-  require "searchkick/reindex_v2_job"
-end
+require "searchkick/railtie" if defined?(Rails)
+require "searchkick/logging" if defined?(ActiveSupport::Notifications)
 
 module Searchkick
+  # background jobs
+  autoload :BulkReindexJob,  "searchkick/bulk_reindex_job"
+  autoload :ProcessBatchJob, "searchkick/process_batch_job"
+  autoload :ProcessQueueJob, "searchkick/process_queue_job"
+  autoload :ReindexV2Job,    "searchkick/reindex_v2_job"
+
   class Error < StandardError; end
   class MissingIndexError < Error; end
   class UnsupportedVersionError < Error; end
@@ -36,7 +35,7 @@ module Searchkick
   class ImportError < Error; end
 
   class << self
-    attr_accessor :search_method_name, :wordnet_path, :timeout, :models, :client_options, :redis
+    attr_accessor :search_method_name, :wordnet_path, :timeout, :models, :client_options, :redis, :index_prefix, :index_suffix, :queue_name, :model_options
     attr_writer :client, :env, :search_timeout
     attr_reader :aws_credentials
   end
@@ -45,21 +44,20 @@ module Searchkick
   self.timeout = 10
   self.models = []
   self.client_options = {}
+  self.queue_name = :searchkick
+  self.model_options = {}
 
   def self.client
     @client ||= begin
-      require "typhoeus/adapters/faraday" if defined?(Typhoeus)
+      require "typhoeus/adapters/faraday" if defined?(Typhoeus) && Gem::Version.new(Faraday::VERSION) < Gem::Version.new("0.14.0")
 
       Elasticsearch::Client.new({
         url: ENV["ELASTICSEARCH_URL"],
-        transport_options: {request: {timeout: timeout}, headers: {content_type: "application/json"}}
+        transport_options: {request: {timeout: timeout}, headers: {content_type: "application/json"}},
+        retry_on_failure: 2
       }.deep_merge(client_options)) do |f|
         f.use Searchkick::Middleware
-        f.request :aws_signers_v4, {
-          credentials: Aws::Credentials.new(aws_credentials[:access_key_id], aws_credentials[:secret_access_key]),
-          service_name: "es",
-          region: aws_credentials[:region] || "us-east-1"
-        } if aws_credentials
+        f.request signer_middleware_key, signer_middleware_aws_params if aws_credentials
       end
     end
   end
@@ -69,7 +67,7 @@ module Searchkick
   end
 
   def self.search_timeout
-    @search_timeout || timeout
+    (defined?(@search_timeout) && @search_timeout) || timeout
   end
 
   def self.server_version
@@ -77,12 +75,44 @@ module Searchkick
   end
 
   def self.server_below?(version)
-    Gem::Version.new(server_version.sub("-", ".")) < Gem::Version.new(version.sub("-", "."))
+    Gem::Version.new(server_version.split("-")[0]) < Gem::Version.new(version.split("-")[0])
   end
 
-  def self.search(term = "*", **options, &block)
-    query = Searchkick::Query.new(nil, term, options)
-    block.call(query.body) if block
+  # memoize for performance
+  def self.server_below7?
+    unless defined?(@server_below7)
+      @server_below7 = server_below?("7.0.0")
+    end
+    @server_below7
+  end
+
+  def self.search(term = "*", model: nil, **options, &block)
+    options = options.dup
+    klass = model
+
+    # convert index_name into models if possible
+    # this should allow for easier upgrade
+    if options[:index_name] && !options[:models] && Array(options[:index_name]).all? { |v| v.respond_to?(:searchkick_index) }
+      options[:models] = options.delete(:index_name)
+    end
+
+    # make Searchkick.search(models: [Product]) and Product.search equivalent
+    unless klass
+      models = Array(options[:models])
+      if models.size == 1
+        klass = models.first
+        options.delete(:models)
+      end
+    end
+
+    if klass
+      if (options[:models] && Array(options[:models]) != [klass]) || Array(options[:index_name]).any? { |v| v.respond_to?(:searchkick_index) && v != klass }
+        raise ArgumentError, "Use Searchkick.search to search multiple models"
+      end
+    end
+
+    options = options.merge(block: block) if block
+    query = Searchkick::Query.new(klass, term, options)
     if options[:execute] == false
       query
     else
@@ -91,13 +121,7 @@ module Searchkick
   end
 
   def self.multi_search(queries)
-    if queries.any?
-      responses = client.msearch(body: queries.flat_map { |q| [q.params.except(:body), q.body] })["responses"]
-      queries.each_with_index do |query, i|
-        query.handle_response(responses[i])
-      end
-    end
-    queries
+    Searchkick::MultiSearch.new(queries).perform
   end
 
   # callbacks
@@ -110,8 +134,12 @@ module Searchkick
     self.callbacks_value = false
   end
 
-  def self.callbacks?
-    Thread.current[:searchkick_callbacks_enabled].nil? || Thread.current[:searchkick_callbacks_enabled]
+  def self.callbacks?(default: true)
+    if callbacks_value.nil?
+      default
+    else
+      callbacks_value != false
+    end
   end
 
   def self.callbacks(value)
@@ -119,8 +147,9 @@ module Searchkick
       previous_value = callbacks_value
       begin
         self.callbacks_value = value
-        yield
+        result = yield
         indexer.perform if callbacks_value == :bulk
+        result
       ensure
         self.callbacks_value = previous_value
       end
@@ -130,7 +159,11 @@ module Searchkick
   end
 
   def self.aws_credentials=(creds)
-    require "faraday_middleware/aws_signers_v4"
+    begin
+      require "faraday_middleware/aws_signers_v4"
+    rescue LoadError
+      require "faraday_middleware/aws_sigv4"
+    end
     @aws_credentials = creds
     @client = nil # reset client
   end
@@ -142,6 +175,8 @@ module Searchkick
         completed: batches_left == 0,
         batches_left: batches_left
       }
+    else
+      raise Searchkick::Error, "Redis not configured"
     end
   end
 
@@ -155,6 +190,10 @@ module Searchkick
         yield redis
       end
     end
+  end
+
+  def self.warn(message)
+    super("[searchkick] WARNING: #{message}")
   end
 
   # private
@@ -192,8 +231,30 @@ module Searchkick
   def self.callbacks_value=(value)
     Thread.current[:searchkick_callbacks_enabled] = value
   end
+
+  # private
+  def self.signer_middleware_key
+    defined?(FaradayMiddleware::AwsSignersV4) ? :aws_signers_v4 : :aws_sigv4
+  end
+
+  # private
+  def self.signer_middleware_aws_params
+    if signer_middleware_key == :aws_sigv4
+      {service: "es", region: "us-east-1"}.merge(aws_credentials)
+    else
+      {
+        credentials: aws_credentials[:credentials] || Aws::Credentials.new(aws_credentials[:access_key_id], aws_credentials[:secret_access_key]),
+        service_name: "es",
+        region: aws_credentials[:region] || "us-east-1"
+      }
+    end
+  end
 end
 
 # TODO find better ActiveModel hook
-ActiveModel::Callbacks.send(:include, Searchkick::Model)
-ActiveRecord::Base.send(:extend, Searchkick::Model) if defined?(ActiveRecord)
+require "active_model/callbacks"
+ActiveModel::Callbacks.include(Searchkick::Model)
+
+ActiveSupport.on_load(:active_record) do
+  extend Searchkick::Model
+end

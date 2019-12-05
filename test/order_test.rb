@@ -17,7 +17,7 @@ class OrderTest < Minitest::Test
     store_names ["Product A", "Product B"]
     product_a = Product.where(name: "Product A").first
     product_b = Product.where(name: "Product B").first
-    assert_order "product", [product_a, product_b].sort_by(&:id).map(&:name), order: {id: :asc}
+    assert_order "product", [product_a, product_b].sort_by { |r| r.id.to_s }.map(&:name), order: {id: :asc}
   end
 
   def test_order_multiple
@@ -29,14 +29,8 @@ class OrderTest < Minitest::Test
     assert_order "product", ["Product A", "Product B", "Product C"], order: {color: :asc, store_id: :desc}
   end
 
-  def test_order_ignore_unmapped
-    skip unless elasticsearch_below50?
-    assert_order "product", [], order: {not_mapped: {ignore_unmapped: true}}, conversions: false
-  end
-
   def test_order_unmapped_type
-    skip if elasticsearch_below50?
-    assert_order "product", [], order: {not_mapped: {unmapped_type: "long"}}, conversions: false
+    assert_order "product", [], order: {not_mapped: {unmapped_type: "long"}}
   end
 
   def test_order_array

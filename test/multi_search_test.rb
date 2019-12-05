@@ -19,4 +19,19 @@ class MultiSearchTest < Minitest::Test
     assert !products.error
     assert stores.error
   end
+
+  def test_misspellings_below_unmet
+    store_names ["abc", "abd", "aee"]
+    products = Product.search("abc", misspellings: {below: 5}, execute: false)
+    Searchkick.multi_search([products])
+    assert_equal ["abc", "abd"], products.map(&:name)
+  end
+
+  def test_query_error
+    products = Product.search("*", order: {bad_column: :asc}, execute: false)
+    Searchkick.multi_search([products])
+    assert products.error
+    error = assert_raises(Searchkick::Error) { products.results }
+    assert_equal error.message, "Query error - use the error method to view it"
+  end
 end

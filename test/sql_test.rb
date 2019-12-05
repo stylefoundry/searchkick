@@ -7,6 +7,11 @@ class SqlTest < Minitest::Test
     assert_search "fresh honey", ["Honey"], operator: "or"
   end
 
+  def test_operator_scoring
+    store_names ["Big Red Circle", "Big Green Circle", "Small Orange Circle"]
+    assert_order "big red circle", ["Big Red Circle", "Big Green Circle", "Small Orange Circle"], operator: "or"
+  end
+
   def test_fields_operator
     store [
       {name: "red", color: "red"},
@@ -32,6 +37,7 @@ class SqlTest < Minitest::Test
   end
 
   def test_fields_both_match
+    # have same score due to dismax
     store [
       {name: "Blue A", color: "red"},
       {name: "Blue B", color: "light blue"}
@@ -120,36 +126,7 @@ class SqlTest < Minitest::Test
     assert_nil hit["_source"]
   end
 
-  def test_select_include
-    skip unless elasticsearch_below50?
-    store [{name: "Product A", user_ids: [1, 2]}]
-    result = Product.search("product", load: false, select: {include: [:name]}).first
-    assert_equal %w(id name), result.keys.reject { |k| k.start_with?("_") }.sort
-    assert_equal "Product A", result.name
-    assert_nil result.store_id
-  end
-
-  def test_select_exclude
-    skip unless elasticsearch_below50?
-    store [{name: "Product A", user_ids: [1, 2], store_id: 1}]
-    result = Product.search("product", load: false, select: {exclude: [:name]}).first
-    assert_nil result.name
-    assert_equal [1, 2], result.user_ids
-    assert_equal 1, result.store_id
-  end
-
-  def test_select_include_and_exclude
-    skip unless elasticsearch_below50?
-    # let's take this to the next level
-    store [{name: "Product A", user_ids: [1, 2], store_id: 1}]
-    result = Product.search("product", load: false, select: {include: [:store_id], exclude: [:name]}).first
-    assert_equal 1, result.store_id
-    assert_nil result.name
-    assert_nil result.user_ids
-  end
-
   def test_select_includes
-    skip if elasticsearch_below50?
     store [{name: "Product A", user_ids: [1, 2]}]
     result = Product.search("product", load: false, select: {includes: [:name]}).first
     assert_equal %w(id name), result.keys.reject { |k| k.start_with?("_") }.sort
@@ -158,7 +135,6 @@ class SqlTest < Minitest::Test
   end
 
   def test_select_excludes
-    skip if elasticsearch_below50?
     store [{name: "Product A", user_ids: [1, 2], store_id: 1}]
     result = Product.search("product", load: false, select: {excludes: [:name]}).first
     assert_nil result.name
@@ -167,7 +143,6 @@ class SqlTest < Minitest::Test
   end
 
   def test_select_include_and_excludes
-    skip if elasticsearch_below50?
     # let's take this to the next level
     store [{name: "Product A", user_ids: [1, 2], store_id: 1}]
     result = Product.search("product", load: false, select: {includes: [:store_id], excludes: [:name]}).first
@@ -189,5 +164,28 @@ class SqlTest < Minitest::Test
     skip unless defined?(ActiveRecord)
     store_names ["Product A"]
     assert Product.search("product", includes: [:store]).first.association(:store).loaded?
+  end
+
+  def test_model_includes
+    skip unless defined?(ActiveRecord)
+
+    store_names ["Product A"]
+    store_names ["Store A"], Store
+
+    associations = {Product => [:store], Store => [:products]}
+    result = Searchkick.search("*", models: [Product, Store], model_includes: associations)
+
+    assert_equal 2, result.length
+
+    result.group_by(&:class).each_pair do |klass, records|
+      assert records.first.association(associations[klass].first).loaded?
+    end
+  end
+
+  def test_scope_results
+    skip unless defined?(ActiveRecord)
+
+    store_names ["Product A", "Product B"]
+    assert_search "product", ["Product A"], scope_results: ->(r) { r.where(name: "Product A") }
   end
 end

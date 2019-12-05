@@ -32,6 +32,9 @@ class GeoShapeTest < Minitest::Test
   end
 
   def test_circle
+    # https://github.com/elastic/elasticsearch/issues/39237
+    skip unless Searchkick.server_below?("6.6.0")
+
     assert_search "*", ["Region A"], {
       where: {
         territory: {
@@ -108,7 +111,7 @@ class GeoShapeTest < Minitest::Test
           geo_shape: {
             type: "envelope",
             relation: "within",
-            coordinates: [[20,50], [50,20]]
+            coordinates: [[20, 50], [50, 20]]
           }
         }
       }
@@ -142,7 +145,9 @@ class GeoShapeTest < Minitest::Test
   end
 
   def test_contains
-    skip if elasticsearch_below22?
+    # CONTAINS query relation not supported
+    skip unless Searchkick.server_below?("6.6.0")
+
     assert_search "*", ["Region C"], {
       where: {
         territory: {
