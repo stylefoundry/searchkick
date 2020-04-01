@@ -295,7 +295,7 @@ module Searchkick
           settings[:analysis][:filter][:searchkick_synonym] = {
             type: "synonym",
             # only remove a single space from synonyms so three-word synonyms will fail noisily instead of silently
-            synonyms: synonyms.select { |s| s.size > 1 }.map { |s| s.is_a?(Array) ? s.map { |s2| s2.sub(/\s+/, "") }.join(",") : s }.map(&:downcase)
+            synonyms: synonyms.map { |s| s.is_a?(Array) ? s.map { |s2| s2.sub(/\s+/, "") }.join(",") : s }.map(&:downcase)
           }
           # choosing a place for the synonym filter when stemming is not easy
           # https://groups.google.com/forum/#!topic/elasticsearch/p7qcQlgHdB8
